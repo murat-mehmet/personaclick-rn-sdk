@@ -1,5 +1,5 @@
 {
-  "name": "@personaclick/rn-sdk",
+  "name": "@mmbt/personaclick-rn-sdk",
   "version": "4.0.6",
   "description": "PersonaClick React Native SDK",
   "type": "module",
