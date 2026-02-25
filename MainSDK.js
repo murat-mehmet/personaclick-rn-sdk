@@ -1499,7 +1499,7 @@ class MainSDK extends Performer {
       const granted = await this.getPushPermission()
       if (!granted) return
       await this.initPushChannel()
-      await this.initPushToken(false)
+      await this.initPushToken(true)
     })
   }
 
@@ -1592,13 +1592,21 @@ class MainSDK extends Performer {
       ...(message.sentTime && { sentTime: `${message.sentTime}` }),
       ...(message.ttl && { ttl: `${message.ttl}` }),
     }
+    const imageUrl = message.data.image || message.data.image_url
     const android = {
       channelId: SDK_PUSH_CHANNEL,
       pressAction: { id: 'default' },
       ...(message.data.icon && { largeIcon: message.data.icon }),
-      ...(message.data.image && {
-        type: AndroidStyle.BIGPICTURE,
-        picture: message.data.image,
+      ...(imageUrl && {
+        style: {
+          type: AndroidStyle.BIGPICTURE,
+          picture: imageUrl,
+        },
+      }),
+    }
+    const ios = {
+      ...(imageUrl && {
+        attachments: [{ url: imageUrl, thumbnailHidden: false }],
       }),
     }
     await notifee.displayNotification({
@@ -1606,6 +1614,7 @@ class MainSDK extends Performer {
       body: message.data.body,
       data,
       android,
+      ios,
     })
   }
 
@@ -1639,7 +1648,7 @@ class MainSDK extends Performer {
    */
   async deleteToken() {
     this._tokenCache = null
-    return savePushToken(false, this.shop_id).then(async () => {
+    return savePushToken('', this.shop_id).then(async () => {
       const messaging = this._ensureMessaging()
       if (messaging) {
         await deleteToken(messaging)
@@ -1693,7 +1702,7 @@ class MainSDK extends Performer {
    * @param {import('react-native-push-notification').ReceivedNotification} [notification]
    * @returns {Promise<boolean | Error | void>}
    */
-  async onClickPush(notification) {
+  async onClickPush(notification, dontOpenUrl) {
     const messageId =
       notification.data?.message_id ||
       notification.data?.['google.message_id'] ||
@@ -1706,6 +1715,7 @@ class MainSDK extends Performer {
       code: notification?.data?.id,
       type: notification?.data?.type,
     })
+    if (dontOpenUrl) return;
 
     const event = pushData[0].data.event
     if (!event) return false
@@ -1774,6 +1784,33 @@ class MainSDK extends Performer {
    */
   async showInAppNotification(params) {
     NotificationManager.showNotification(params)
+  }
+
+  /**
+   * Register background message handler early (before initPush).
+   * Call this in preInit() for killed-state notification handling.
+   */
+  _registerBackgroundHandler() {
+    const messaging = this._ensureMessaging()
+    if (!messaging) return
+    setBackgroundMessageHandler(messaging, async (remoteMessage) => {
+      if (this.lastMessageIds.includes(remoteMessage.messageId)) {
+        return false
+      } else {
+        this.lastMessageIds.push(remoteMessage.messageId)
+      }
+
+      await this.notificationDelivered({
+        code: remoteMessage.data.id,
+        type: remoteMessage.data.type,
+      })
+      if (DEBUG) console.log('Background message delivered: ', remoteMessage)
+
+      await updPushData(remoteMessage, this.shop_id)
+      await this.pushBgReceivedListener(remoteMessage)
+    })
+    // Mark orchestrator so it doesn't try to register again
+    this._pushOrchestrator._backgroundMessageHandlerSet = true
   }
 
   /**
