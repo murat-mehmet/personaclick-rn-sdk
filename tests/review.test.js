@@ -1,8 +1,4 @@
-import REES46 from '../index.js'
-
-jest.mock('react-native-device-info', () => ({}))
-jest.mock('@react-native-firebase/messaging', () => ({}))
-jest.mock('@react-native-async-storage/async-storage', () => ({}))
+import PersonaClick from '../index.js'
 
 const mockRequest = jest.fn()
 jest.mock('../lib/client.js', () => {
@@ -17,11 +13,16 @@ describe('Review', () => {
   let sdk
 
   beforeEach(() => {
-    sdk = new REES46('357382bf66ac0ce2f1722677c59511', 'android', true)
+    mockRequest.mockImplementation((endpoint) => {
+      if (endpoint === 'init') {
+        return Promise.resolve({ did: 'jest-did', seance: 'jest-seance', segment: '' })
+      }
+      return Promise.resolve({})
+    })
+    sdk = new PersonaClick('357382bf66ac0ce2f1722677c59511', 'android', true)
     jest.spyOn(sdk, 'push').mockImplementation((callback) => {
       callback()
     })
-    mockRequest.mockResolvedValue(undefined)
     mockRequest.mockClear()
   })
 
@@ -71,13 +72,13 @@ describe('Review', () => {
     await expect(sdk.review(0, 'mobile', 'order')).rejects.toThrow(
       'Error: rating can be between 1 and 10 only'
     )
-    expect(mockRequest).not.toHaveBeenCalled()
+    expect(mockRequest.mock.calls.filter((c) => c[0] === 'nps/create')).toHaveLength(0)
   })
 
   test('should reject when rate is greater than 10', async () => {
     await expect(sdk.review(11, 'mobile', 'order')).rejects.toThrow(
       'Error: rating can be between 1 and 10 only'
     )
-    expect(mockRequest).not.toHaveBeenCalled()
+    expect(mockRequest.mock.calls.filter((c) => c[0] === 'nps/create')).toHaveLength(0)
   })
 })

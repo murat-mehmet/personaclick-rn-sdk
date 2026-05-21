@@ -24,6 +24,8 @@ import { getToken } from '@react-native-firebase/messaging'
 import { getAPNSToken } from '@react-native-firebase/messaging'
 import { deleteToken } from '@react-native-firebase/messaging'
 import { onNotificationOpenedApp } from '@react-native-firebase/messaging'
+import { getInitialNotification } from '@react-native-firebase/messaging'
+import { onTokenRefresh } from '@react-native-firebase/messaging'
 import notifee from '@notifee/react-native'
 import { AndroidImportance } from '@notifee/react-native'
 import { AndroidStyle } from '@notifee/react-native'
@@ -39,6 +41,9 @@ import { SDK_API_URL } from './index'
 import { parseCartItem, parseProductInfo, parseProductsListResponse } from './types/productTypes'
 import { prepareAndShow, registerSDK } from './components/Popup/SdkPopupOverlay'
 import PopupLogic from './lib/popup'
+import { buildTrackCustomEventParams } from './lib/buildTrackCustomEventParams'
+import { buildPurchasePredictQueryParams } from './lib/buildPurchasePredictQueryParams'
+import { buildPurchaseTrackingParams } from './lib/buildPurchaseTrackingParams.js'
 
 /** Minimum allowed NPS/review rate (1–10). */
 const REVIEW_RATE_MIN = 1
@@ -170,6 +175,9 @@ class MainSDK extends Performer {
     // In-memory token cache: avoids AsyncStorage race when getToken() is called
     // immediately after initPushToken() (savePushToken runs after backend response).
     this._tokenCache = null
+    // Overridable hook: reads the persisted push token from AsyncStorage.
+    // Can be replaced (e.g. in e2e tests) to bypass AsyncStorage synchronously.
+    this._getSavedPushToken = getSavedPushToken
     // Tracks the in-flight initPush() promise so getToken() can await it
     // when called concurrently (e.g. autoSendPushToken race in init()).
     this._initPushPromise = null
@@ -185,16 +193,22 @@ class MainSDK extends Performer {
       onMessage,
       setBackgroundMessageHandler,
       onNotificationOpenedApp,
+      getInitialNotification,
+      onTokenRefresh,
+      onNewToken: (token) => {
+        this._tokenCache = token
+        this.setPushTokenNotification(token)
+      },
       notifee,
       EventType,
       getPushData,
       updPushData,
       notificationDelivered: (options) => this.notificationDelivered(options),
-      pushReceivedListener: (remoteMessage) =>
-        this.pushReceivedListener.call(this, remoteMessage),
-      pushBgReceivedListener: (remoteMessage) =>
-        this.pushBgReceivedListener.call(this, remoteMessage),
-      pushClickListener: (event) => this.pushClickListener.call(this, event),
+      defaultClickListener: (event) => this.onClickPush(event),
+      defaultReceiveListener: (remoteMessage) =>
+        this.showNotification(remoteMessage),
+      defaultBgReceiveListener: (remoteMessage) =>
+        this.showNotification(remoteMessage),
       getShopId: () => this.shop_id,
       hasSeenMessageId: (messageId) => this.lastMessageIds.includes(messageId),
       markMessageIdSeen: (messageId) => {
@@ -561,26 +575,35 @@ class MainSDK extends Performer {
   }
 
   /**
-   * @param {import('@react-native-firebase/messaging').RemoteMessage} remoteMessage
-   * @returns {Promise<void>}
+   * @deprecated Use `initPush(click, ...)` to register a click handler. Kept as
+   * a proxy to PushOrchestrator's listener so existing direct accessors keep
+   * working.
    */
-  pushReceivedListener = async function (remoteMessage) {
-    await this.showNotification(remoteMessage)
+  get pushClickListener() {
+    return this._pushOrchestrator._clickListener ?? this._pushOrchestrator._deps.defaultClickListener
+  }
+  set pushClickListener(fn) {
+    this._pushOrchestrator.setListeners({ click: fn })
   }
 
   /**
-   * @param {import('@react-native-firebase/messaging').RemoteMessage} remoteMessage
-   * @returns {Promise<void>}
+   * @deprecated Use `initPush(_, receive, _)` instead.
    */
-  pushBgReceivedListener = async function (remoteMessage) {
-    await this.showNotification(remoteMessage)
+  get pushReceivedListener() {
+    return this._pushOrchestrator._receiveListener ?? this._pushOrchestrator._deps.defaultReceiveListener
+  }
+  set pushReceivedListener(fn) {
+    this._pushOrchestrator.setListeners({ receive: fn })
   }
 
   /**
-   * @returns {Promise<void>}
+   * @deprecated Use `initPush(_, _, bgReceive)` instead.
    */
-  pushClickListener = async function (event) {
-    await this.onClickPush(event)
+  get pushBgReceivedListener() {
+    return this._pushOrchestrator._bgReceiveListener ?? this._pushOrchestrator._deps.defaultBgReceiveListener
+  }
+  set pushBgReceivedListener(fn) {
+    this._pushOrchestrator.setListeners({ bgReceive: fn })
   }
 
   track(event, options) {
@@ -608,17 +631,60 @@ class MainSDK extends Performer {
   }
 
   /**
-   * @param {string} event
-   * @param {Record<string, any>} options
+   * Strict purchase tracking (`push`, `event` = `purchase`). Prefer this over `track('purchase', …)`.
+   * @param {import('./types/purchaseTracking').PurchaseTrackingRequest} purchaseRequest
    * @returns {void}
    */
-  trackEvent(event, options) {
+  trackPurchase(purchaseRequest) {
+    /** @type {Record<string, unknown>} */
+    let queryParams
+    try {
+      queryParams = buildPurchaseTrackingParams(purchaseRequest)
+    } catch (err) {
+      console.error(err?.message ?? err)
+      return
+    }
+
     this.push(async () => {
       try {
-        let queryParams = { event: event }
-        if (options) {
-          queryParams = Object.assign(queryParams, options)
-        }
+        const sourceParams = await getSourceParams(this.shop_id)
+        Object.assign(queryParams, sourceParams)
+        const response = await request('push', this.shop_id, {
+          headers: { 'Content-Type': 'application/json' },
+          method: 'POST',
+          params: {
+            shop_id: this.shop_id,
+            stream: this.stream,
+            ...queryParams,
+          },
+        })
+        await this.checkAndShowPopup(response)
+        return response
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error('[SDK] trackPurchase failed:', error)
+        return error
+      }
+    })
+  }
+
+  /**
+   * @param {string} event
+   * @param {import('./types/customEventParams').CustomEventParams | undefined} [params]
+   * @returns {void}
+   */
+  trackEvent(event, params) {
+    /** @type {Record<string, unknown>} */
+    let queryParams
+    try {
+      queryParams = buildTrackCustomEventParams(event, params)
+    } catch (err) {
+      console.error(err?.message ?? err)
+      return
+    }
+
+    this.push(async () => {
+      try {
         const sourceParams = await getSourceParams(this.shop_id)
         Object.assign(queryParams, sourceParams)
 
@@ -726,6 +792,48 @@ class MainSDK extends Performer {
             },
           })
           // Check for popup in response
+          await this.checkAndShowPopup(res)
+          resolve(res)
+        } catch (error) {
+          reject(error)
+        }
+      })
+    })
+  }
+
+  /**
+   * GET predict/probability-to-purchase — predicted purchase probability for the current visitor.
+   *
+   * @param {import('./types/purchasePredict').PurchasePredictParams} [params={}] — Optional `email`, `phone`, `telegram_id`, `loyalty_id` (API names). Empty object uses only SDK `did` / session.
+   * @returns {Promise<import('./types/purchasePredict').PurchasePredictResponse>}
+   */
+  getProbabilityToPurchase(params = {}) {
+    return new Promise((resolve, reject) => {
+      this.push(async () => {
+        try {
+          const storageData = await getData(this.shop_id)
+          const deviceId = storageData?.did || this.deviceId || ''
+          if (deviceId && deviceId !== this.deviceId) {
+            this.deviceId = deviceId
+          }
+          const extra = buildPurchasePredictQueryParams(params)
+          const res = await request('predict/probability-to-purchase', this.shop_id, {
+            params: {
+              shop_id: this.shop_id,
+              stream: this.stream,
+              did: deviceId,
+              ...extra,
+            },
+          })
+          // request() resolves even on errors — reject on Error instance or API error message
+          if (res instanceof Error) {
+            reject(res)
+            return
+          }
+          if (res && typeof res.probability === 'undefined' && res.message) {
+            reject(new Error(res.message))
+            return
+          }
           await this.checkAndShowPopup(res)
           resolve(res)
         } catch (error) {
@@ -1423,16 +1531,16 @@ class MainSDK extends Performer {
     // Fast path: in-memory cache populated on the same JS run (avoids AsyncStorage race).
     if (!removeOld && this._tokenCache) {
       if (DEBUG) console.log('FCM token from memory cache: ', this._tokenCache)
-      await this._pushOrchestrator.ensureTrackingSubscriptions()
+      await this._pushOrchestrator.installSubscriptions()
       return this._tokenCache
     }
 
-    const savedToken = await getSavedPushToken(this.shop_id)
+    const savedToken = await this._getSavedPushToken(this.shop_id)
     if (savedToken) {
       if (DEBUG) console.log('Old valid FCM token: ', savedToken)
       this._tokenCache = savedToken
       // Even when token is already cached, ensure tracking subscriptions are installed.
-      await this._pushOrchestrator.ensureTrackingSubscriptions()
+      await this._pushOrchestrator.installSubscriptions()
       return savedToken
     }
 
@@ -1516,15 +1624,14 @@ class MainSDK extends Performer {
     notifyBgReceive = false
   ) {
     // Always allow updating listeners, even if initPush() is called repeatedly.
-    if (notifyClick) {
-      this.pushClickListener = notifyClick
-      this._pushOrchestrator.setHasCustomClickListener(true)
-    }
-    if (notifyReceive) this.pushReceivedListener = notifyReceive
-    if (notifyBgReceive) this.pushBgReceivedListener = notifyBgReceive
+    // Replays a buffered cold-start through `notifyClick` if the default already
+    // consumed it (e.g. autoSendPushToken auto-init ran first).
+    this._pushOrchestrator.setListeners({
+      click: notifyClick || undefined,
+      receive: notifyReceive || undefined,
+      bgReceive: notifyBgReceive || undefined,
+    })
 
-    // If this exact initPush() call is already in-flight (e.g. concurrent button taps),
-    // join the existing promise instead of starting a duplicate run.
     if (this._initPushPromise) {
       return this._initPushPromise
     }
@@ -1536,8 +1643,7 @@ class MainSDK extends Performer {
       lock.state === true &&
       new Date().getTime() < lock.expires
     ) {
-      // Ensure subscriptions exist even if init is locked.
-      await this._pushOrchestrator.ensureTrackingSubscriptions()
+      await this._pushOrchestrator.installSubscriptions()
       return false
     }
 
@@ -1558,7 +1664,7 @@ class MainSDK extends Performer {
           await setInitLocker(false, this.shop_id)
         }
 
-        await this._pushOrchestrator.ensureTrackingSubscriptions()
+        await this._pushOrchestrator.installSubscriptions()
         return token ?? null
       } finally {
         this._initPushPromise = null

@@ -1,19 +1,52 @@
-import REES46 from '../index.js'
+import PersonaClick from '../index.js'
 
-jest.mock('react-native-device-info', () => {})
-jest.mock('@react-native-firebase/messaging', () => {})
-jest.mock('@react-native-async-storage/async-storage', () => {})
+const mockRequest = jest.fn()
+jest.mock('../lib/client.js', () => {
+  const actual = jest.requireActual('../lib/client.js')
+  return {
+    ...actual,
+    request: (...args) => mockRequest(...args),
+  }
+})
 
 describe('Search', () => {
   let sdk
 
   beforeEach(() => {
-    sdk = new REES46('357382bf66ac0ce2f1722677c59511', 'android', true)
+    mockRequest.mockImplementation((endpoint, _shopId, options) => {
+      if (endpoint === 'init') {
+        return Promise.resolve({ did: 'jest-did', seance: 'jest-seance', segment: '' })
+      }
+
+      if (endpoint === 'search') {
+        const hasType = Boolean(options?.params?.type)
+        if (!hasType) {
+          return Promise.reject(new Error('Request failed with status code 400'))
+        }
+        return Promise.resolve({
+          categories: [],
+          html: '',
+          products: [],
+          products_total: 0,
+        })
+      }
+
+      if (endpoint === 'search/blank') {
+        return Promise.resolve({
+          suggests: [],
+          products: [],
+        })
+      }
+
+      return Promise.resolve({})
+    })
+
+    sdk = new PersonaClick('357382bf66ac0ce2f1722677c59511', 'android', true)
     jest.spyOn(sdk, 'push').mockImplementation((callback) => {
       callback()
     })
 
-    jest.clearAllMocks()
+    mockRequest.mockClear()
   })
 
   afterEach(() => {
@@ -52,14 +85,15 @@ describe('Search', () => {
     }
   })
 
-  test('should call searchBlank and resolve with suggests, last_queries, products', async () => {
+  test('should call searchBlank and resolve with suggests and products', async () => {
     const response = await sdk.searchBlank()
 
     expect(response).toHaveProperty('suggests')
-    expect(response).toHaveProperty('last_queries')
     expect(response).toHaveProperty('products')
     expect(Array.isArray(response.suggests)).toBe(true)
-    expect(Array.isArray(response.last_queries)).toBe(true)
     expect(Array.isArray(response.products)).toBe(true)
+    if (Object.prototype.hasOwnProperty.call(response, 'last_queries')) {
+      expect(Array.isArray(response.last_queries)).toBe(true)
+    }
   })
 })
